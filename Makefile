@@ -1,17 +1,18 @@
-.PHONY: all amd64 crate_esp run clean
+.PHONY: all amd64 crate_esp run clean install-depends
 
 all: amd64 run
 
+# 编译bootloader和kernel
 amd64:
-	@cd bootloader && cargo xbuild --release
-	@cd kernel && cargo xbuild --target .cargo/amd64.json --release
+	@cd bootloader && cargo build --release
+	@cd kernel && cargo build  --release
 	@make crate_esp
 
 # x86_64编译出的文件目录
 crate_esp:
 	@mkdir -p build/pc/esp/EFI/kernel build/pc/esp/EFI/Boot
-	@cp bootloader/target/x86_64-unknown-uefi/release/bootloader.efi build/pc/esp/EFI/Boot/BootX64.efi
-	@cp kernel/target/amd64/release/kernel build/pc/esp/EFI/kernel/kernel.elf
+	@cp target/x86_64-unknown-uefi/release/bootloader.efi build/pc/esp/EFI/Boot/BootX64.efi
+	@cp target/amd64/release/kernel build/pc/esp/EFI/kernel/kernel.elf
 
 # QEMU运行x86_64
 run:
@@ -19,11 +20,17 @@ run:
     -drive if=pflash,format=raw,file=bootloader/OVMF.fd,readonly=on \
     -drive format=raw,file=fat:rw:build/pc/esp \
     -m 1024 \
-    -nographic \
     -no-fd-bootchk \
-    -smp 2
+    -smp 2 \
+    -nographic \
 
+# 清理编译出来的文件
 clean:
-	@cd bootloader && cargo clean
-	@cd kernel && cargo clean
+	@cargo clean
 	@rm -rf build
+
+# 依赖安装
+install-depends:
+	rustup install nightly
+	rustup default nightly
+	rustup component add rust-src

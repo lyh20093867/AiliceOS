@@ -1,17 +1,40 @@
 //! 该文件是从'rust-osdev/bootloader'中的'page_table.rs'修改而来的
 use log::*;
+use uefi::table::boot::{AllocateType, BootServices, MemoryType};
+use uefi::ResultExt;
+use x86_64::registers::control::{Cr3, Cr3Flags, Cr4, Cr4Flags, Efer, EferFlags};
 use x86_64::structures::paging::{
-    mapper::*, FrameAllocator, Mapper, Page, PageSize, PageTableFlags, PhysFrame, Size2MiB,
-    Size4KiB, UnusedPhysFrame,
+    mapper::*, FrameAllocator, Mapper, Page, PageSize, PageTable, PageTableFlags, PhysFrame,
+    Size2MiB, Size4KiB,
 };
 use x86_64::{align_up, PhysAddr, VirtAddr};
 use xmas_elf::{program, ElfFile};
+
+pub struct UEFIFrameAllocator<'a>(&'a BootServices);
+
+impl<'a> UEFIFrameAllocator<'a> {
+    pub fn new(services: &'a BootServices) -> Self {
+        Self(services)
+    }
+}
+
+unsafe impl<'a> FrameAllocator<Size4KiB> for UEFIFrameAllocator<'a> {
+    fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        let phys_addr = self
+            .0
+            .allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_DATA, 1)
+            .expect_success("Failed to allocate physical frame");
+        let phys_addr = PhysAddr::new(phys_addr);
+        let phys_frame = PhysFrame::containing_address(phys_addr);
+        Some(phys_frame)
+    }
+}
 
 pub fn map_elf(
     elf: &ElfFile,
     page_table: &mut impl Mapper<Size4KiB>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-) -> Result<(), MapToError> {
+) -> Result<(), MapToError<Size4KiB>> {
     info!("mapping ELF");
     let kernel_start = PhysAddr::new(elf.input.as_ptr() as u64);
     for segment in elf.program_iter() {
@@ -20,38 +43,12 @@ pub fn map_elf(
     Ok(())
 }
 
-#[allow(dead_code)]
-pub fn map_stack(
-    addr: u64,
-    pages: u64,
-    page_table: &mut impl Mapper<Size4KiB>,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-) -> Result<(), MapToError> {
-    info!("mapping stack at {:#x}", addr);
-    // create a stack
-    let stack_start = Page::containing_address(VirtAddr::new(addr));
-    let stack_end = stack_start + pages;
-
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-
-    for page in Page::range(stack_start, stack_end) {
-        let frame = frame_allocator
-            .allocate_frame()
-            .ok_or(MapToError::FrameAllocationFailed)?;
-        page_table
-            .map_to(page, frame, flags, frame_allocator)?
-            .flush();
-    }
-
-    Ok(())
-}
-
 fn map_segment(
     segment: &program::ProgramHeader,
     kernel_start: PhysAddr,
     page_table: &mut impl Mapper<Size4KiB>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-) -> Result<(), MapToError> {
+) -> Result<(), MapToError<Size4KiB>> {
     if let program::Type::Load = segment.get_type().unwrap() {
         let mem_size = segment.mem_size();
         let file_size = segment.file_size();
@@ -75,10 +72,11 @@ fn map_segment(
         for frame in PhysFrame::range_inclusive(start_frame, end_frame) {
             let offset = frame - start_frame;
             let page = start_page + offset;
-            let unused_frame = unsafe { UnusedPhysFrame::new(frame) };
-            page_table
-                .map_to(page, unused_frame, page_table_flags, frame_allocator)?
-                .flush();
+            unsafe {
+                page_table
+                    .map_to(page, frame, page_table_flags, frame_allocator)?
+                    .flush();
+            }
         }
 
         if mem_size > file_size {
@@ -106,16 +104,18 @@ fn map_segment(
                 }
 
                 // remap last page
-                if let Err(e) = page_table.unmap(last_page.clone()) {
+                if let Err(e) = page_table.unmap(last_page) {
                     return Err(match e {
                         UnmapError::ParentEntryHugePage => MapToError::ParentEntryHugePage,
                         UnmapError::PageNotMapped => unreachable!(),
                         UnmapError::InvalidFrameAddress(_) => unreachable!(),
                     });
                 }
-                page_table
-                    .map_to(last_page, new_frame, page_table_flags, frame_allocator)?
-                    .flush();
+                unsafe {
+                    page_table
+                        .map_to(last_page, new_frame, page_table_flags, frame_allocator)?
+                        .flush();
+                }
             }
 
             // Map additional frames.
@@ -128,9 +128,11 @@ fn map_segment(
                 let frame = frame_allocator
                     .allocate_frame()
                     .ok_or(MapToError::FrameAllocationFailed)?;
-                page_table
-                    .map_to(page, frame, page_table_flags, frame_allocator)?
-                    .flush();
+                unsafe {
+                    page_table
+                        .map_to(page, frame, page_table_flags, frame_allocator)?
+                        .flush();
+                }
             }
 
             // zero bss
@@ -159,10 +161,62 @@ pub fn map_physical_memory(
     for frame in PhysFrame::range_inclusive(start_frame, end_frame) {
         let page = Page::containing_address(VirtAddr::new(frame.start_address().as_u64() + offset));
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-        let unused_frame = unsafe { UnusedPhysFrame::new(frame) };
-        page_table
-            .map_to(page, unused_frame, flags, frame_allocator)
-            .expect("failed to map physical memory")
-            .flush();
+        unsafe {
+            page_table
+                .map_to(page, frame, flags, frame_allocator)
+                .expect("failed to map physical memory")
+                .flush();
+        }
     }
+}
+
+/// Set up a basic recursive page table.
+pub fn init_recursive(
+    allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> RecursivePageTable<'static> {
+    // First we do a copy for the level 4 table here, because the old table
+    // has memory type `BOOT_SERVICES_DATA`. Level 3 ~ level 1 tables will
+    // be discarded eventually so we can ignore them.
+    let old_l4_table_addr = Cr3::read().0.start_address().as_u64();
+    let l4_table_frame = allocator.allocate_frame().unwrap();
+    let l4_table_addr = l4_table_frame.start_address().as_u64();
+
+    // Safety: newly allocated frame is guaranteed to be valid and unused
+    unsafe {
+        core::ptr::copy(
+            old_l4_table_addr as *const u8,
+            l4_table_addr as *mut u8,
+            l4_table_frame.size() as usize,
+        )
+    };
+
+    // Safety: same as above
+    let l4_table = unsafe { &mut *(l4_table_addr as *mut PageTable) };
+
+    // Recursive mapping
+    l4_table[0b111_111_111].set_frame(
+        l4_table_frame,
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
+    );
+
+    // Enable all CPU extensions we need.
+    unsafe {
+        Cr4::update(|cr4| {
+            cr4.insert(
+                Cr4Flags::PAGE_SIZE_EXTENSION
+                    | Cr4Flags::PHYSICAL_ADDRESS_EXTENSION
+                    | Cr4Flags::PAGE_GLOBAL
+                    | Cr4Flags::OSFXSR,
+            )
+        });
+        Efer::update(|efer| efer.insert(EferFlags::NO_EXECUTE_ENABLE));
+    };
+
+    // Switch to the new page table...
+    unsafe { Cr3::write(l4_table_frame, Cr3Flags::empty()) };
+
+    // And we have it!
+    let l4_table = unsafe { &mut *(0xFFFF_FFFF_FFFF_F000 as *mut PageTable) };
+
+    RecursivePageTable::new(l4_table).unwrap()
 }

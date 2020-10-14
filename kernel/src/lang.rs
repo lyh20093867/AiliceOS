@@ -1,4 +1,5 @@
 use core::panic::PanicInfo;
+use core::alloc::Layout;
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
@@ -11,6 +12,13 @@ fn panic(info: &PanicInfo) -> ! {
 extern "C" fn abort() -> ! {
     panic!("abort!");
 }
+
+
+#[lang = "oom"]
+fn oom(layout: Layout) -> ! {
+    panic!("Memory allocation of {} bytes failed", layout.size());
+}
+
 
 #[lang = "eh_personality"]
 #[no_mangle]

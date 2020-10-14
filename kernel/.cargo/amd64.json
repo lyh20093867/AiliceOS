@@ -12,7 +12,7 @@
   "linker": "rust-lld",
   "pre-link-args": {
     "ld.lld": [
-      "-T.cargo/linker-amd64.ld",
+      "-Tkernel/.cargo/linker-amd64.ld",
       "-export-dynamic"
     ]
   },

@@ -1,5 +1,5 @@
 [build]
-target = "x86_64-unknown-uefi"
+target = ".cargo/amd64.json"
 
 [unstable]
 build-std = ["core","alloc", "compiler_builtins"]
