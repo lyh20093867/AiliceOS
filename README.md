@@ -79,3 +79,9 @@ $  rustup component add rust-src
 ```
 $  make all
 ```
+
+致谢：
+
+Rcore
+
+osdev
